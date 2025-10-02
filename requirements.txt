@@ -5,4 +5,4 @@ websockets==11.0.3
 soundfile==0.12.1
 numpy==1.26.4
 python-dotenv==1.0.0
-
+pyttsx3==2.99
