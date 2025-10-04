@@ -5,12 +5,15 @@ from flask import Flask, request, jsonify
 from twilio.twiml.voice_response import VoiceResponse, Gather, Dial
 from datetime import datetime
 from typing import Optional, Dict
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Optional: Gemini for NLU (fallback to keyword rules if not configured)
 USE_GEMINI = False
 try:
     import google.generativeai as genai
-    GEMINI_API_KEY = os.getenv("AIzaSyD0P1sfusJX2T-f6k1ozhcQ5eKkhj8F7Ww")
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
     if GEMINI_API_KEY:
         genai.configure(api_key=GEMINI_API_KEY)
         USE_GEMINI = True
