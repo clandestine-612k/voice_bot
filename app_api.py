@@ -351,7 +351,7 @@ if __name__ == "__main__":
     ws_thread.start()
     
     # Start Flask HTTP server
-    port = int(os.getenv("PORT", 8080)) #port changed
+    port = int(os.getenv("PORT", 5000)) #port changed
     print(f"[Flask] Starting HTTP server on port {port}")
     print(f"[Config] PUBLIC_HOST: {PUBLIC_HOST}")
     print(f"[Config] Cafe: {CAFE_NAME}")
