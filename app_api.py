@@ -325,36 +325,43 @@ Response:"""
                 pass
 
 
-# ---------- Run servers ----------
-
-def start_ws_server():
-    """Start WebSocket server for Twilio media streams"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    ws_server = websockets.serve(
-        handle_twilio_media, 
-        "0.0.0.0", 
-        8765,
-        ping_interval=20,
-        ping_timeout=10
-    )
-    
-    print("[WebSocket] Starting server on port 8765 (path /media)")
-    loop.run_until_complete(ws_server)
-    loop.run_forever()
-
+# ---------- IMPORTANT: Do not run this file directly in production ----------
+# For production use: python production_start.py
+# For local dev only: python app_api.py
 
 if __name__ == "__main__":
+    print("=" * 70)
+    print("⚠️  DEVELOPMENT MODE - Flask development server")
+    print("⚠️  NOT FOR PRODUCTION!")
+    print("=" * 70)
+    print("For production deployment on Railway, use:")
+    print("  → python production_start.py")
+    print("=" * 70)
+    print()
+    
     # Start WebSocket server in background thread
-    ws_thread = Thread(target=start_ws_server, daemon=True)
+    def start_ws_dev():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        ws_server = websockets.serve(
+            handle_twilio_media, 
+            "0.0.0.0", 
+            8765,
+            ping_interval=20,
+            ping_timeout=10
+        )
+        print("[WebSocket] Starting server on port 8765")
+        loop.run_until_complete(ws_server)
+        loop.run_forever()
+    
+    ws_thread = Thread(target=start_ws_dev, daemon=True)
     ws_thread.start()
     
     # Start Flask HTTP server
-    port = int(os.getenv("PORT", 5000)) #port changed
+    port = int(os.getenv("PORT", 5000))
     print(f"[Flask] Starting HTTP server on port {port}")
     print(f"[Config] PUBLIC_HOST: {PUBLIC_HOST}")
     print(f"[Config] Cafe: {CAFE_NAME}")
+    print()
     
-    # Use waitress or gunicorn in production instead of Flask debug
-    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=port, debug=True, use_reloader=False)
