@@ -77,7 +77,7 @@ if GEMINI_API_KEY:
 app = Flask(__name__, static_folder="static")
 
 
-@app.route("/voice", methods=["POST"])
+@app.route("/voice", methods=["GET","POST"])
 def voice():
     """
     Twilio will POST here when a call arrives.
