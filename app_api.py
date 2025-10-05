@@ -3,7 +3,6 @@ Real-time receptionist:
 - /voice (Flask) -> returns TwiML to start Media Stream to wss://PUBLIC_HOST/media
 - /media (websocket server) -> receives Twilio media events, forwards audio to Deepgram WS,
   receives transcripts, sends to Gemini, synthesizes reply (gTTS -> mp3), and plays into call
-  by updating Twilio call TwiML to <Play> the mp3 URL.
 
 Environment variables required:
 - PUBLIC_HOST (e.g. https://voice.yourdomain.com)  (no trailing slash)
@@ -13,26 +12,24 @@ Environment variables required:
 - GEMINI_API_KEY
 - CAFE_NAME (optional)
 - STAFF_NUMBER (optional)
+- CAFE_HOURS (optional)
+- MENU_LINK (optional)
 """
 
 import os
 import asyncio
-import base64
 import json
 import time
-import tempfile
 from pathlib import Path
 from threading import Thread
 
 from flask import Flask, request, Response, send_from_directory
-from twilio.twiml.voice_response import VoiceResponse
+from twilio.twiml.voice_response import VoiceResponse, Connect, Stream
 from twilio.rest import Client as TwilioRestClient
 from gtts import gTTS
 import websockets
-import requests
 from dotenv import load_dotenv
 import google.generativeai as genai
-import aiofiles
 
 load_dotenv()
 
@@ -40,6 +37,9 @@ load_dotenv()
 PUBLIC_HOST = os.getenv("PUBLIC_HOST")  # e.g. https://voice.yourcafe.com (required)
 if not PUBLIC_HOST:
     raise SystemExit("Set PUBLIC_HOST env var (e.g. https://voice.yourcafe.com)")
+
+# Remove trailing slash if present
+PUBLIC_HOST = PUBLIC_HOST.rstrip('/')
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
@@ -52,202 +52,309 @@ if not DEEPGRAM_API_KEY:
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
-    # allow non-Gemini fallback, but best to set it
     print("WARNING: GEMINI_API_KEY not set — replies will be basic.")
 
 CAFE_NAME = os.getenv("CAFE_NAME", "Your Café")
 STAFF_NUMBER = os.getenv("STAFF_NUMBER", None)
+CAFE_HOURS = os.getenv("CAFE_HOURS", "Monday to Sunday, 8 AM to 9 PM")
+MENU_LINK = os.getenv("MENU_LINK", "https://example.com/menu")
 
-# deepgram realtime websocket url (Twilio streams μ-law 8k by default)
-DEEPGRAM_WS_URL = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000"
+# Deepgram realtime websocket url (Twilio streams μ-law 8k by default)
+DEEPGRAM_WS_URL = "wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&punctuate=true"
 
 # Ensure static dir exists
 STATIC_DIR = Path("static")
 STATIC_DIR.mkdir(exist_ok=True)
 
-# twilio client
+# Twilio client
 twilio_client = TwilioRestClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-# configure Gemini (if provided)
+# Configure Gemini (if provided)
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    GEMINI_MODEL_NAME = "gemini-1.5-flash"  # adjust as desired
+    GEMINI_MODEL_NAME = "gemini-1.5-flash"
 
-# ---------- Flask app (for /voice TwiML and serving static audio) ----------
+# Track greeting state per call
+call_states = {}
+
+# ---------- Flask app ----------
 app = Flask(__name__, static_folder="static")
 
 
-@app.route("/voice", methods=["GET","POST"])
+@app.route("/voice", methods=["POST", "GET"])
 def voice():
     """
     Twilio will POST here when a call arrives.
     Return TwiML that starts a Media Stream to wss://PUBLIC_HOST/media
     """
     resp = VoiceResponse()
-    resp.say(f"Hi — welcome to {CAFE_NAME}. Connecting you to our receptionist.", voice="alice", language="en-IN")
-    # Twilio expects wss URL (no trailing slash)
-    stream_url = f"wss://{PUBLIC_HOST.replace('https://','').replace('http://','')}/media"
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say voice="alice" language="en-IN">Connecting you now.</Say>
-    <Connect>
-        <Stream url="{stream_url}"/>
-    </Connect>
-</Response>"""
-    return Response(twiml, mimetype="text/xml")
+    
+    # Extract hostname from PUBLIC_HOST for WebSocket URL
+    hostname = PUBLIC_HOST.replace('https://', '').replace('http://', '')
+    stream_url = f"wss://{hostname}/media"
+    
+    # Use TwiML objects - Start stream immediately without initial Say
+    connect = Connect()
+    connect.stream(url=stream_url)
+    resp.append(connect)
+    
+    return Response(str(resp), mimetype="text/xml")
 
 
 @app.route("/static/<path:filename>")
 def static_file(filename):
-    # serve generated audio files
+    """Serve generated audio files"""
     return send_from_directory(str(STATIC_DIR), filename)
 
 
-# ---------- WebSocket media server (Twilio Media Streams) ----------
-# We'll run a separate asyncio WebSocket server at /media and port 8765
-# Twilio will connect to wss://PUBLIC_HOST/media
+@app.route("/health")
+def health():
+    """Health check endpoint"""
+    return {"status": "ok", "cafe": CAFE_NAME}
+
+
+# ---------- WebSocket media server ----------
 
 async def handle_twilio_media(ws, path):
     """
-    Each connection is one call's media stream.
-    Twilio sends events: 'start', 'media', 'stop'. For 'start' event we capture callSid.
-    For 'media' events we get base64 mu-law audio payload. We forward this to Deepgram WS.
-    When Deepgram returns a final transcript, we call Gemini for a reply, synthesize to mp3,
-    store it at static/<filename>, then instruct Twilio to play it into the call using REST API.
+    Handles Twilio Media Stream WebSocket connection.
+    Processes audio, transcribes with Deepgram, generates responses with Gemini,
+    and plays them back into the call.
     """
     dg_ws = None
     call_sid = None
     stream_sid = None
+    read_task = None
+    has_greeted = False
 
     try:
-        # Open a Deepgram WS connection
+        # Open Deepgram WebSocket connection
         dg_ws = await websockets.connect(
             DEEPGRAM_WS_URL,
             extra_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"}
         )
+        print("[Deepgram] Connected")
 
-        # create an async task to listen to Deepgram messages
+        async def send_greeting(call_sid):
+            """Send initial greeting when call starts"""
+            greeting = f"Hello! Thank you for calling {CAFE_NAME}. I'm your virtual receptionist. How may I help you today?"
+            print(f"[Bot] Greeting: {greeting}")
+            await play_response(call_sid, greeting)
+
         async def read_deepgram():
-            nonlocal dg_ws, call_sid
+            """Listen to Deepgram transcription results"""
+            nonlocal call_sid, has_greeted
+            
             async for dg_msg in dg_ws:
                 try:
                     obj = json.loads(dg_msg)
-                except Exception:
+                except json.JSONDecodeError:
                     continue
-                # Deepgram final transcription arrives as {"type":"Transcription", ... } or channel object.
-                # check for transcript in obj
+
+                # Check if this is a final transcript
+                is_final = obj.get("is_final", False)
+                if not is_final:
+                    continue
+
+                # Extract transcript
                 transcript = None
                 if "channel" in obj:
-                    alt = obj["channel"].get("alternatives")
-                    if alt and len(alt) > 0:
-                        transcript = alt[0].get("transcript", "").strip()
-                # Some Deepgram messages are partials; we only act on non-empty final transcripts
-                if transcript:
-                    print("[Deepgram] transcript:", transcript)
-                    # Ask Gemini (if available) to generate reply
-                    if GEMINI_API_KEY:
-                        try:
-                            model = genai.GenerativeModel(GEMINI_MODEL_NAME)
-                            prompt = (
-                                "You are a polite cafe receptionist. Keep replies short and actionable.\n"
-                                f"Customer: {transcript}\nAssistant:"
-                            )
-                            out = model.generate_content(prompt)
-                            reply_text = (out.text or "").strip()
-                        except Exception as e:
-                            print("Gemini error:", e)
-                            reply_text = "Sorry, I couldn't process that. Could you repeat?"
-                    else:
-                        # fallback simple rule-based reply
-                        if "hour" in transcript.lower() or "open" in transcript.lower():
-                            reply_text = f"We are open {os.getenv('CAFE_HOURS','Mon–Sun, 8 AM to 9 PM')}."
-                        elif "menu" in transcript.lower():
-                            reply_text = f"Our menu is at {os.getenv('MENU_LINK','https://example.com/menu')}."
-                        elif "reserve" in transcript.lower() or "book" in transcript.lower():
-                            reply_text = "Sure — please tell me the number of people and time."
-                        else:
-                            reply_text = "Sorry, I didn't get that. Can you repeat?"
+                    alternatives = obj["channel"].get("alternatives", [])
+                    if alternatives and len(alternatives) > 0:
+                        transcript = alternatives[0].get("transcript", "").strip()
 
-                    print("[Bot] reply:", reply_text)
+                if not transcript:
+                    continue
 
-                    # Synthesize reply to mp3 using gTTS (works on Render)
-                    timestamp = int(time.time() * 1000)
-                    filename = f"reply_{call_sid or 'call'}_{timestamp}.mp3"
-                    out_path = STATIC_DIR / filename
-                    try:
-                        tts = gTTS(reply_text, lang="en")
-                        tts.save(str(out_path))
-                    except Exception as e:
-                        print("gTTS error:", e)
-                        continue
+                print(f"[Deepgram] Final transcript: {transcript}")
 
-                    # Now instruct Twilio to play the file into the live call using REST API
-                    if call_sid:
-                        try:
-                            public_url = f"{PUBLIC_HOST}/static/{filename}"
-                            twiml_play = f"<Response><Play>{public_url}</Play></Response>"
-                            twilio_client.calls(call_sid).update(twiml=twiml_play)
-                            print(f"Injected audio into call {call_sid}: {public_url}")
-                        except Exception as e:
-                            print("Twilio play error:", e)
-                    else:
-                        print("No call_sid found — cannot inject audio.")
+                # Generate response
+                reply_text = await generate_reply(transcript, call_sid)
+                print(f"[Bot] Reply: {reply_text}")
 
+                # Synthesize and play response
+                await play_response(call_sid, reply_text)
+
+        async def generate_reply(transcript, call_sid):
+            """Generate reply using Gemini or fallback logic"""
+            # Track conversation state
+            if call_sid not in call_states:
+                call_states[call_sid] = {"message_count": 0}
+            
+            call_states[call_sid]["message_count"] += 1
+            
+            if GEMINI_API_KEY:
+                try:
+                    model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+                    
+                    # Enhanced prompt with context and conversation awareness
+                    prompt = f"""You are a polite and helpful receptionist for {CAFE_NAME}.
+
+Context:
+- Operating hours: {CAFE_HOURS}
+- Menu available at: {MENU_LINK}
+{f"- Staff contact: {STAFF_NUMBER}" if STAFF_NUMBER else ""}
+
+This is message #{call_states[call_sid]["message_count"]} in the conversation.
+
+Customer said: "{transcript}"
+
+Provide a brief, natural, and helpful response (1-2 sentences max). Be conversational and friendly.
+If the customer is just greeting back or saying hello, acknowledge it briefly and ask how you can help them.
+
+Response:"""
+                    
+                    response = model.generate_content(prompt)
+                    reply_text = response.text.strip()
+                    
+                    # Ensure reply isn't too long
+                    if len(reply_text) > 200:
+                        reply_text = reply_text[:197] + "..."
+                    
+                    return reply_text
+                    
+                except Exception as e:
+                    print(f"[Gemini] Error: {e}")
+                    return "Sorry, I'm having trouble processing that. Could you please repeat?"
+            else:
+                # Fallback rule-based responses
+                transcript_lower = transcript.lower()
+                
+                # Handle greetings
+                if any(word in transcript_lower for word in ["hello", "hi", "hey"]):
+                    return "Nice to hear from you! What can I help you with today?"
+                elif "hour" in transcript_lower or "open" in transcript_lower:
+                    return f"We are open {CAFE_HOURS}."
+                elif "menu" in transcript_lower:
+                    return f"You can view our menu at {MENU_LINK}."
+                elif "reserve" in transcript_lower or "book" in transcript_lower:
+                    return "Sure! How many people and what time would you like?"
+                elif "location" in transcript_lower or "address" in transcript_lower:
+                    return f"We are located at {CAFE_NAME}. Would you like directions?"
+                else:
+                    return "I didn't quite catch that. Could you please repeat?"
+
+        async def play_response(call_sid, text):
+            """Synthesize speech and play it into the call"""
+            if not call_sid:
+                print("[Error] No call_sid available")
+                return
+
+            # Generate unique filename
+            timestamp = int(time.time() * 1000)
+            filename = f"reply_{call_sid}_{timestamp}.mp3"
+            out_path = STATIC_DIR / filename
+
+            try:
+                # Synthesize speech
+                tts = gTTS(text, lang="en", slow=False)
+                tts.save(str(out_path))
+                print(f"[TTS] Saved audio to {filename}")
+
+                # Play audio into call
+                public_url = f"{PUBLIC_HOST}/static/{filename}"
+                twiml_play = f'<?xml version="1.0" encoding="UTF-8"?><Response><Play>{public_url}</Play><Pause length="1"/></Response>'
+                
+                twilio_client.calls(call_sid).update(twiml=twiml_play)
+                print(f"[Twilio] Playing audio: {public_url}")
+
+            except Exception as e:
+                print(f"[Error] Failed to play response: {e}")
+
+        # Start Deepgram listener task
         read_task = asyncio.create_task(read_deepgram())
 
-        # Read messages from Twilio and forward binary audio to Deepgram
+        # Process Twilio media stream
         async for raw in ws:
-            # Twilio sends text JSON messages
-            data = json.loads(raw)
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
             event = data.get("event")
+
             if event == "start":
                 start = data.get("start", {})
-                stream_sid = start.get("streamSid") or start.get("streamId")
-                call_sid = start.get("callSid") or start.get("CallSid") or call_sid
-                print("Media start:", stream_sid, "call:", call_sid)
+                stream_sid = start.get("streamSid")
+                call_sid = start.get("callSid")
+                print(f"[Twilio] Media stream started - Call: {call_sid}, Stream: {stream_sid}")
+                
+                # Send greeting as soon as stream starts
+                if not has_greeted:
+                    # Small delay to ensure connection is stable
+                    await asyncio.sleep(0.5)
+                    await send_greeting(call_sid)
+                    has_greeted = True
+
             elif event == "media":
-                # media payload is base64 mu-law bytes
-                media = data.get("media", {})
-                payload_b64 = media.get("payload")
-                if not payload_b64:
-                    continue
-                # Forward to Deepgram: send JSON with type Binary and audio (base64)
-                await dg_ws.send(json.dumps({
-                    "type": "Binary",
-                    "audio": payload_b64
-                }))
+                # Forward audio to Deepgram only after greeting
+                if has_greeted:
+                    media = data.get("media", {})
+                    payload_b64 = media.get("payload")
+                    
+                    if payload_b64 and dg_ws:
+                        await dg_ws.send(json.dumps({
+                            "type": "Binary",
+                            "audio": payload_b64
+                        }))
+
             elif event == "stop":
-                print("Media stopped")
+                print("[Twilio] Media stream stopped")
+                # Clean up call state
+                if call_sid and call_sid in call_states:
+                    del call_states[call_sid]
                 break
 
-        # Clean up
-        if read_task:
-            read_task.cancel()
-        if dg_ws:
-            await dg_ws.close()
+    except websockets.exceptions.ConnectionClosed:
+        print("[WebSocket] Connection closed")
     except Exception as e:
-        print("WS handler error:", e)
-        try:
-            if dg_ws:
+        print(f"[Error] WebSocket handler: {e}")
+    finally:
+        # Cleanup
+        if read_task and not read_task.done():
+            read_task.cancel()
+            try:
+                await read_task
+            except asyncio.CancelledError:
+                pass
+        
+        if dg_ws:
+            try:
                 await dg_ws.close()
-        except:
-            pass
+            except:
+                pass
 
 
-# ---------- Run both Flask (HTTP) and the websocket server concurrently ----------
+# ---------- Run servers ----------
+
 def start_ws_server():
-    # websockets server listens on port 8765 and path /media
+    """Start WebSocket server for Twilio media streams"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    ws_server = websockets.serve(handle_twilio_media, "0.0.0.0", 8765, ping_interval=20, ping_timeout=10)
-    print("Starting websocket server on port 8765 (path /media)")
+    
+    ws_server = websockets.serve(
+        handle_twilio_media, 
+        "0.0.0.0", 
+        8765,
+        ping_interval=20,
+        ping_timeout=10
+    )
+    
+    print("[WebSocket] Starting server on port 8765 (path /media)")
     loop.run_until_complete(ws_server)
     loop.run_forever()
 
 
 if __name__ == "__main__":
-    # Start WS server in background thread
-    Thread(target=start_ws_server, daemon=True).start()
-
-    # Start Flask (HTTP) — Twilio webhook uses /voice on port 5000
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
+    # Start WebSocket server in background thread
+    ws_thread = Thread(target=start_ws_server, daemon=True)
+    ws_thread.start()
+    
+    # Start Flask HTTP server
+    port = int(os.getenv("PORT", 5000))
+    print(f"[Flask] Starting HTTP server on port {port}")
+    print(f"[Config] PUBLIC_HOST: {PUBLIC_HOST}")
+    print(f"[Config] Cafe: {CAFE_NAME}")
+    
+    # Use waitress or gunicorn in production instead of Flask debug
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
