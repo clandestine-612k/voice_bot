@@ -74,9 +74,6 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     GEMINI_MODEL_NAME = "gemini-1.5-flash"
 
-# Track greeting state per call
-call_states = {}
-
 # ---------- Flask app ----------
 app = Flask(__name__, static_folder="static")
 
@@ -88,12 +85,17 @@ def voice():
     Return TwiML that starts a Media Stream to wss://PUBLIC_HOST/media
     """
     resp = VoiceResponse()
+    resp.say(
+        f"Hi, welcome to {CAFE_NAME}. Connecting you to our receptionist.", 
+        voice="Polly.Aditi", 
+        language="en-IN"
+    )
     
     # Extract hostname from PUBLIC_HOST for WebSocket URL
     hostname = PUBLIC_HOST.replace('https://', '').replace('http://', '')
     stream_url = f"wss://{hostname}/media"
     
-    # Use TwiML objects - Start stream immediately without initial Say
+    # Use TwiML objects instead of raw XML string
     connect = Connect()
     connect.stream(url=stream_url)
     resp.append(connect)
@@ -125,7 +127,6 @@ async def handle_twilio_media(ws, path):
     call_sid = None
     stream_sid = None
     read_task = None
-    has_greeted = False
 
     try:
         # Open Deepgram WebSocket connection
@@ -135,15 +136,9 @@ async def handle_twilio_media(ws, path):
         )
         print("[Deepgram] Connected")
 
-        async def send_greeting(call_sid):
-            """Send initial greeting when call starts"""
-            greeting = f"Hello! Thank you for calling {CAFE_NAME}. I'm your virtual receptionist. How may I help you today?"
-            print(f"[Bot] Greeting: {greeting}")
-            await play_response(call_sid, greeting)
-
         async def read_deepgram():
             """Listen to Deepgram transcription results"""
-            nonlocal call_sid, has_greeted
+            nonlocal call_sid
             
             async for dg_msg in dg_ws:
                 try:
@@ -169,25 +164,19 @@ async def handle_twilio_media(ws, path):
                 print(f"[Deepgram] Final transcript: {transcript}")
 
                 # Generate response
-                reply_text = await generate_reply(transcript, call_sid)
+                reply_text = await generate_reply(transcript)
                 print(f"[Bot] Reply: {reply_text}")
 
                 # Synthesize and play response
                 await play_response(call_sid, reply_text)
 
-        async def generate_reply(transcript, call_sid):
+        async def generate_reply(transcript):
             """Generate reply using Gemini or fallback logic"""
-            # Track conversation state
-            if call_sid not in call_states:
-                call_states[call_sid] = {"message_count": 0}
-            
-            call_states[call_sid]["message_count"] += 1
-            
             if GEMINI_API_KEY:
                 try:
                     model = genai.GenerativeModel(GEMINI_MODEL_NAME)
                     
-                    # Enhanced prompt with context and conversation awareness
+                    # Enhanced prompt with context
                     prompt = f"""You are a polite and helpful receptionist for {CAFE_NAME}.
 
 Context:
@@ -195,12 +184,9 @@ Context:
 - Menu available at: {MENU_LINK}
 {f"- Staff contact: {STAFF_NUMBER}" if STAFF_NUMBER else ""}
 
-This is message #{call_states[call_sid]["message_count"]} in the conversation.
-
 Customer said: "{transcript}"
 
 Provide a brief, natural, and helpful response (1-2 sentences max). Be conversational and friendly.
-If the customer is just greeting back or saying hello, acknowledge it briefly and ask how you can help them.
 
 Response:"""
                     
@@ -215,15 +201,11 @@ Response:"""
                     
                 except Exception as e:
                     print(f"[Gemini] Error: {e}")
-                    return "Sorry, I'm having trouble processing that. Could you please repeat?"
+                    return "Sorry, I'm having trouble processing that. Could you repeat?"
             else:
                 # Fallback rule-based responses
                 transcript_lower = transcript.lower()
-                
-                # Handle greetings
-                if any(word in transcript_lower for word in ["hello", "hi", "hey"]):
-                    return "Nice to hear from you! What can I help you with today?"
-                elif "hour" in transcript_lower or "open" in transcript_lower:
+                if "hour" in transcript_lower or "open" in transcript_lower:
                     return f"We are open {CAFE_HOURS}."
                 elif "menu" in transcript_lower:
                     return f"You can view our menu at {MENU_LINK}."
@@ -278,31 +260,20 @@ Response:"""
                 stream_sid = start.get("streamSid")
                 call_sid = start.get("callSid")
                 print(f"[Twilio] Media stream started - Call: {call_sid}, Stream: {stream_sid}")
-                
-                # Send greeting as soon as stream starts
-                if not has_greeted:
-                    # Small delay to ensure connection is stable
-                    await asyncio.sleep(0.5)
-                    await send_greeting(call_sid)
-                    has_greeted = True
 
             elif event == "media":
-                # Forward audio to Deepgram only after greeting
-                if has_greeted:
-                    media = data.get("media", {})
-                    payload_b64 = media.get("payload")
-                    
-                    if payload_b64 and dg_ws:
-                        await dg_ws.send(json.dumps({
-                            "type": "Binary",
-                            "audio": payload_b64
-                        }))
+                # Forward audio to Deepgram
+                media = data.get("media", {})
+                payload_b64 = media.get("payload")
+                
+                if payload_b64 and dg_ws:
+                    await dg_ws.send(json.dumps({
+                        "type": "Binary",
+                        "audio": payload_b64
+                    }))
 
             elif event == "stop":
                 print("[Twilio] Media stream stopped")
-                # Clean up call state
-                if call_sid and call_sid in call_states:
-                    del call_states[call_sid]
                 break
 
     except websockets.exceptions.ConnectionClosed:
@@ -325,36 +296,29 @@ Response:"""
                 pass
 
 
-# ---------- IMPORTANT: Do not run this file directly in production ----------
-# For production use: python production_start.py
-# For local dev only: python app_api.py
+# ---------- Run servers ----------
+
+def start_ws_server():
+    """Start WebSocket server for Twilio media streams"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    ws_server = websockets.serve(
+        handle_twilio_media, 
+        "0.0.0.0", 
+        8765,
+        ping_interval=20,
+        ping_timeout=10
+    )
+    
+    print("[WebSocket] Starting server on port 8765 (path /media)")
+    loop.run_until_complete(ws_server)
+    loop.run_forever()
+
 
 if __name__ == "__main__":
-    print("=" * 70)
-    print("⚠️  DEVELOPMENT MODE - Flask development server")
-    print("⚠️  NOT FOR PRODUCTION!")
-    print("=" * 70)
-    print("For production deployment on Railway, use:")
-    print("  → python production_start.py")
-    print("=" * 70)
-    print()
-    
     # Start WebSocket server in background thread
-    def start_ws_dev():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        ws_server = websockets.serve(
-            handle_twilio_media, 
-            "0.0.0.0", 
-            8765,
-            ping_interval=20,
-            ping_timeout=10
-        )
-        print("[WebSocket] Starting server on port 8765")
-        loop.run_until_complete(ws_server)
-        loop.run_forever()
-    
-    ws_thread = Thread(target=start_ws_dev, daemon=True)
+    ws_thread = Thread(target=start_ws_server, daemon=True)
     ws_thread.start()
     
     # Start Flask HTTP server
@@ -362,6 +326,6 @@ if __name__ == "__main__":
     print(f"[Flask] Starting HTTP server on port {port}")
     print(f"[Config] PUBLIC_HOST: {PUBLIC_HOST}")
     print(f"[Config] Cafe: {CAFE_NAME}")
-    print()
     
-    app.run(host="0.0.0.0", port=port, debug=True, use_reloader=False)
+    # Use waitress or gunicorn in production instead of Flask debug
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
